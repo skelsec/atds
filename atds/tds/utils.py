@@ -31,6 +31,9 @@ class BufferReader:
         """Reads 16bit unsigned integer from the stream"""
         self.check_size(2)
         return int.from_bytes(self.buffer.read(2), byteorder='little', signed=False)
+
+    def get_ushort(self) -> int:
+        return self.get_usmallint()
     
     def get_byte(self) -> int:
         """Reads one byte from stream"""
@@ -83,7 +86,6 @@ class BufferReader:
         """
         self.check_size(size)
         data = self.buffer.read(size)
-        print(data)
         return codec.decode(data)[0]
 
     def get_collation(self) -> Collation:
@@ -108,5 +110,15 @@ class BufferReader:
         :param size: Number of bytes to read
         :returns: Bytes read from stream
         """
+        self.check_size(size)
+        return self.buffer.read(size)
+
+    def skipall(self, size: int):
+        """Skips size bytes from stream"""
+        self.check_size(size)
+        self.buffer.read(size)
+    
+    def read(self, size: int) -> bytes:
+        """Reads size bytes from stream"""
         self.check_size(size)
         return self.buffer.read(size)

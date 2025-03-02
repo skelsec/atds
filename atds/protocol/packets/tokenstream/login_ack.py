@@ -1,6 +1,9 @@
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Optional
+from atds.tds.utils import BufferReader
+import io
+from atds.protocol.packets.tokenstream import TDSTokenStreamBase
 
 class Interface(IntEnum):
     SQL_DFLT = 0    # Server confirms whatever client sent (defaults to SQL_TSQL)
@@ -32,54 +35,28 @@ class Version:
             build_low=data[3]
         )
 
-class TDS_LOGIN_ACK:
+class TDS_LOGIN_ACK(TDSTokenStreamBase):
     TOKEN_TYPE = 0xAD  # LOGINACK_TOKEN
 
-    def __init__(self) -> None:
+    def __init__(self, **kwargs) -> None:
+        super().__init__(0xAD, **kwargs)
         self.length: int = 0
         self.interface: Interface = Interface.SQL_DFLT
         self.tds_version: int = 0
         self.prog_name: str = ""
         self.prog_version: Version = Version(0, 0, 0, 0)
 
-    @staticmethod
-    def from_bytes(data: bytes) -> 'TDS_LOGIN_ACK':
-        if len(data) < 3:  # Minimum: token(1) + length(2)
-            raise ValueError("LOGIN_ACK data too short")
-
+    def from_reader(self, reader: BufferReader) -> 'TDS_LOGIN_ACK':
         # Verify token type
-        if data[0] != TDS_LOGIN_ACK.TOKEN_TYPE:
-            raise ValueError(f"Invalid TOKEN_TYPE: expected 0xAD, got {hex(data[0])}")
-
-        packet = TDS_LOGIN_ACK()
-        
-        # Parse length (2 bytes)
-        packet.length = int.from_bytes(data[1:3], byteorder='little')
-        
-        if len(data) < packet.length + 3:
-            raise ValueError("Data shorter than specified length")
-        
-        pos = 3  # Start after token and length
-        
-        # Parse interface (1 byte)
-        packet.interface = Interface(data[pos])
-        pos += 1
-        
-        # Parse TDS version (4 bytes)
-        packet.tds_version = int.from_bytes(data[pos:pos+4], byteorder='little')
-        pos += 4
-        
-        # Parse program name (B_VARCHAR)
-        name_length = data[pos]
-        pos += 1
-        packet.prog_name = data[pos:pos+name_length].decode('utf-16-le')
-        pos += name_length
-        
-        # Parse program version (4 bytes)
-        packet.prog_version = Version.from_bytes(data[pos:pos+4])
-        pos += 4
-        
-        return packet
+        token = reader.get_byte()
+        if token != TDS_LOGIN_ACK.TOKEN_TYPE:
+            raise ValueError(f"Invalid TOKEN_TYPE: expected 0xAD, got {hex(token)}")
+        self.length = reader.get_ushort()
+        self.interface = Interface(reader.get_byte())
+        self.tds_version = reader.get_uint()
+        self.prog_name = reader.read_ucs2(reader.get_byte())
+        self.prog_version = Version.from_bytes(reader.read(4))
+        return self
     
     def __str__(self):
         return f"TDS_LOGIN_ACK(length={self.length}, interface={self.interface}, tds_version={self.tds_version}, prog_name={self.prog_name}, prog_version={self.prog_version})"

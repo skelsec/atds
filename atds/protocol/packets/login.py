@@ -122,9 +122,6 @@ class TDS_LOGIN:
 
         for fieldname in self.fields:
             field = self.fields[fieldname]
-            print(fieldname)
-            print(field.value)
-            print(current_offset)
             if isinstance(field, TDSLoginField):
                 if field.value == "":
                     if fieldname != 'hostname':
@@ -187,7 +184,6 @@ class TDS_LOGIN:
             if isinstance(field, TDSLoginFieldClientID):
                 continue
             if field.length > 0:
-                print(field)
                 packet.extend(field.value)
 
         # Update packet length

@@ -1,5 +1,6 @@
 
 import random
+import copy
 from asysocks.unicomm.common.target import UniTarget, UniProto
 from urllib.parse import urlparse, parse_qs
 from asysocks.unicomm.utils.paramprocessor import str_one, int_one, bool_one
@@ -16,6 +17,7 @@ mssql_target_url_params = {
     'sqlappname' : str_one,
     'sqlclientname' : str_one,
     'sqlpid' : int_one,
+    'sqlpipename' : str_one,
 }
 
 
@@ -24,7 +26,7 @@ class MSSQLTarget(UniTarget):
     def __init__(self, ip, port = 1433, protocol = UniProto.CLIENT_TCP, proxies = None, timeout = 10, 
                     sqlvermajor = 15, sqlverminor = 0, sqlverbuild = 4123, sqlinstance = 'MSSQLServer', sqlthreadid = None, 
                     sqlencrypt = True, dns:str=None, dc_ip:str = None, domain:str = None, hostname:str = None, sqlpacketsize:int = 32764,
-                    sqlappname:str = 'atds', sqlclientname:str = 'atds', sqlpid:int = None, database:str = None):
+                    sqlappname:str = 'atds', sqlclientname:str = 'atds', sqlpid:int = None, database:str = None, pipename:str = None):
         UniTarget.__init__(self, ip, port, protocol, timeout, hostname = hostname, proxies = proxies, domain = domain, dc_ip = dc_ip, dns=dns)
         self.database = database
         self.sqlvermajor = sqlvermajor
@@ -37,6 +39,7 @@ class MSSQLTarget(UniTarget):
         self.sqlappname = sqlappname
         self.sqlclientname = sqlclientname
         self.sqlpid = sqlpid
+        self.pipename = pipename
 
         if sqlthreadid is None:
             self.sqlthreadid = random.randint(0, 0xFFFFFFFF)
@@ -54,6 +57,32 @@ class MSSQLTarget(UniTarget):
 
     def is_ssl(self):
         return self.protocol == UniProto.CLIENT_SSL_TCP
+
+    def get_smb_target(self):
+        from aiosmb.commons.connection.target import SMBTarget
+
+        if self.pipename is None or self.pipename == '':
+            raise Exception('Pipename must be provided!')
+        
+        pipename = self.pipename
+        if self.pipename.upper().startswith('\\IPC$\\') is False:
+            if pipename.startswith('\\') is False:
+                pipename = '\\IPC$\\%s' % pipename
+            else:
+                pipename = '\\%s' % pipename
+
+        return SMBTarget(
+            ip = self.ip,
+            hostname = self.hostname,
+            port = 445,
+            protocol = UniProto.CLIENT_TCP,
+            proxies = copy.deepcopy(self.proxies),
+            timeout = self.timeout,
+            domain = self.domain,
+            dc_ip = self.dc_ip,
+            dns = self.dns,
+            path = pipename,
+        )
     
     @staticmethod
     def from_url(connection_url):
@@ -78,6 +107,8 @@ class MSSQLTarget(UniTarget):
         
         unitarget, extraparams = UniTarget.from_url(connection_url, protocol, port, mssql_target_url_params)
         database = path
+        # remove extraparams if they are None
+        extraparams = {k: v for k, v in extraparams.items() if v is not None}
         sqlvermajor = extraparams.get('sqlvermajor', 15)
         sqlverminor = extraparams.get('sqlverminor', 0)
         sqlverbuild = extraparams.get('sqlverbuild', 4123)
@@ -85,9 +116,13 @@ class MSSQLTarget(UniTarget):
         sqlthreadid = extraparams.get('sqlthreadid', random.randint(0, 0xFFFFFFFF))
         sqlencrypt = extraparams.get('sqlencrypt', True)
         sqlpacketsize = extraparams.get('sqlpacketsize', 32764)
-        sqlappname = extraparams.get('sqlappname', None)
-        sqlclientname = extraparams.get('sqlclientname', None)
+        sqlappname = extraparams.get('sqlappname', 'atds')
+        sqlclientname = extraparams.get('sqlclientname', 'atds')
         sqlpid = extraparams.get('sqlpid', None)
+        pipename = extraparams.get('sqlpipename', None)
+
+        if pipename is not None:
+            port = 445
 
         target = MSSQLTarget(
             unitarget.ip, 
@@ -110,6 +145,7 @@ class MSSQLTarget(UniTarget):
             sqlappname = sqlappname,
             sqlclientname = sqlclientname,
             sqlpid = sqlpid,
+            pipename = pipename,
         )
         return target
 

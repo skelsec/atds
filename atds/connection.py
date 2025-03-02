@@ -2,11 +2,15 @@ import ssl
 import asyncio
 import random
 import traceback
+import copy
+import re
+import warnings
+from datetime import datetime, date
 
 from asysocks.unicomm.client import UniClient
 from asysocks.unicomm.common.packetizers import Packetizer
 
-from typing import cast
+from typing import cast, List, Tuple, Any, Union
 from atds.common.target import MSSQLTarget
 from atds.protocol.packets import TDSPacket, TDSStatus
 from atds.network.packetizer import TDSPacketizer
@@ -14,18 +18,17 @@ from atds.protocol.packets import TDSPacketType
 from atds.protocol.packets.prelogin import PreLoginOption, EncryptMode, TDS_PRELOGIN, PreLoginOptionToken
 from atds.protocol.packets.login import TDS_LOGIN, TDS_LOGIN_FLAGS2
 from atds.protocol.packets.tokenstream import TDSTokenType, TDSTokenParser
-from atds.protocol.packets.tokenstream.sspi import TDS_SSPI
-from atds.protocol.packets.tokenstream.colmetadata import TDS_COLMETADATA
-from atds.protocol.packets.tokenstream.error import TDS_ERROR
-from atds.protocol.packets.tokenstream.row import TDS_ROW
+from atds.cursor import TDSCursor, QueryResult, RowType
 
-from asyauth.common.credentials.kerberos import KerberosCredential
+from asyauth.common.constants import asyauthProtocol
+from atds.network.pipe import SMBPipeNetwork
 
 def encryptPassword(password:str | bytes) -> bytes:
     if isinstance(password, str):
         return bytes(bytearray([((x & 0x0f) << 4) + ((x & 0xf0) >> 4) ^ 0xa5 for x in password.encode('utf-16-le')]))
     else:
         return bytes(bytearray([((x & 0x0f) << 4) + ((x & 0xf0) >> 4) ^ 0xa5 for x in password]))
+
 
 class MSSQLConnection:
     def __init__(self, target, credential, auth=None):
@@ -52,10 +55,21 @@ class MSSQLConnection:
         # incoming data parser
         self.__token_parser = TDSTokenParser()
         self.__result_queue = asyncio.Queue()
+        self.__query_lock = asyncio.Lock()
+
+        self.connection_closed_event = asyncio.Event()
+    
+    def get_extra_info(self):
+        try:
+            ntlm_data = self.auth.get_extra_info()
+        except:
+            traceback.print_exc()
+            ntlm_data = None
+        return {'ntlm_data' : ntlm_data}
         
     async def __aenter__(self):
         return self
-		
+        
     async def __aexit__(self, exc_type, exc, traceback):
         await asyncio.wait_for(self.disconnect(), timeout = 1)
 
@@ -94,7 +108,6 @@ class MSSQLConnection:
 
         except Exception as e:
             traceback.print_exc()
-            print(e)
         finally:
             await self.disconnect()
 
@@ -110,17 +123,21 @@ class MSSQLConnection:
                     
         except Exception as e:
             traceback.print_exc()
-            print(e)
         finally:
+            print('INCOMING READ FINISHED')
             await self.disconnect()
 
     async def __handle_incoming_packet_data(self, raw_data):
         try:
             async for packet in self.packetizer.data_in(raw_data):
+                if packet is None:
+                    break
                 if packet.Type == TDSPacketType.TABULAR_RESULT:
                     for tokentype, token in self.__token_parser.from_bytes(packet.Data):
-                        await self.__result_queue.put((tokentype, token))
-                    
+                        await self.__result_queue.put((packet.Type, tokentype, token))
+                
+                else:
+                    await self.__result_queue.put((packet.Type, None, packet))
                 if TDSStatus.EOM in packet.Status:
                     break
         except Exception as e:
@@ -147,7 +164,6 @@ class MSSQLConnection:
         if self.server_encryption == EncryptMode.ENCRYPT_OFF:
             self.tls_obj = None
             self.network.change_packetizer(TDSPacketizer())
-            #self.network.change_packetizer(Packetizer())
             return await self.network.read_one()
 
         # Read TLS records one at a time
@@ -201,21 +217,40 @@ class MSSQLConnection:
     
     
     async def disconnect(self):
-        if self._closed is True:
-            return
-        self._closed = True
-        if self.network is not None:
-            await self.network.close()
-        if self.tls_obj is not None:
-            self.tls_obj.close()
-        if self.handle_incoming_task is not None:
-            self.handle_incoming_task.cancel()
+        try:
+            if self._closed is True:
+                return
+            self._closed = True
+            
+            if self.network is not None:
+                await self.network.close()
+            if self.handle_incoming_task is not None:
+                self.handle_incoming_task.cancel()
+            self.__handle_incoming_packet_data.put_nowait(None)
+        finally:
+            self.connection_closed_event.set()
     
-    
-    async def connect(self) -> tuple[bool, Exception]:
+    async def fake_login(self):
         try:
             client = UniClient(self.target, self.packetizer)
             self.network = await asyncio.wait_for(client.connect(), timeout=self.target.timeout)
+            await self.prelogin()
+            return True, None
+        except Exception as e:
+            return False, e
+    
+    async def connect(self) -> tuple[bool, Exception]:
+        try:
+            if self.target.pipename is None:
+                self.packetizer = TDSPacketizer()
+                client = UniClient(self.target, self.packetizer)
+                self.network = await asyncio.wait_for(client.connect(), timeout=self.target.timeout)
+            else:
+                self.network = SMBPipeNetwork(self.target, self.credential)
+                _, err = await self.network.connect()
+                if err is not None:
+                    raise err
+                self.network.change_packetizer(self.packetizer)
             await self.prelogin()
             await self.login()
 
@@ -265,15 +300,15 @@ class MSSQLConnection:
                 from asyauth.common.credentials.spnego import SPNEGOCredential
                 
                 kerberostarget = self.target.get_kerberos_target()
-                self.authapi = SPNEGOCredential([self.credential]).build_context(target=kerberostarget)
+                self.auth = SPNEGOCredential([self.credential]).build_context(target=kerberostarget)
             else:
                  # This is using raw NTLM, not SPNEGO
-                self.authapi = self.credential.build_context()
+                self.auth = self.credential.build_context()
             login.flags2 |= TDS_LOGIN_FLAGS2.INTEGRATED_SECURITY
 
             token = None
             while True:
-                data, to_continue, err = await self.authapi.authenticate(token, flags = None, spn=self.target.to_target_string())
+                data, to_continue, err = await self.auth.authenticate(token, flags = None, spn=self.target.to_target_string())
                 if err is not None:
                     raise err
                 if to_continue is False and data is None or data == b'':
@@ -288,7 +323,6 @@ class MSSQLConnection:
                     packet.Data = login_data
                     packet.PacketID = 1
                 else:
-                    #login_data = TDS_SSPI(data).to_bytes()
                     packet = TDSPacket()
                     packet.Type = TDSPacketType.TABULAR_RESULT
                     packet.Data = data
@@ -388,7 +422,7 @@ class MSSQLConnection:
         # Will automatically encrypt the packet if encryption is enabled
         if self.tls_obj is None:
             await self.network.write(packet.to_bytes())
-        else:
+        else: 
             self.tls_obj.write(packet.to_bytes())
             while True:
                 raw = self.tls_out_buff.read()
@@ -398,29 +432,51 @@ class MSSQLConnection:
                 break
 
 
-    async def batch(self, sql:str):
+    def get_cursor(self, stream:bool = False, rowtype:Union[str, RowType] = RowType.LIST):
+        # TODO: this function will need to be updated to support MARS and other features
+        return TDSCursor(self, stream, rowtype)
+
+    async def batch_raw(self, sql:str):
         try:
-            packet = TDSPacket()
-            packet.Type = TDSPacketType.SQL_BATCH
-            packet.Data = sql.encode('utf-16-le')
-            await self.send_packet(packet)
-            while True:
-                tokentype, token = await self.__result_queue.get()
-                if token is None:
-                    break
-                if tokentype == TDSTokenType.DONE:
-                    break
-                if tokentype == TDSTokenType.ERROR:
-                    raise Exception(token.message)
-                if tokentype == TDSTokenType.ROW:
-                    token = cast(TDS_ROW, token)
-                    print(token.rows)
-                if tokentype == TDSTokenType.COLMETADATA:
-                    token = cast(TDS_COLMETADATA, token)
-                    print(token.header_tuple)
+            async with self.__query_lock:
+                packet = TDSPacket()
+                packet.Type = TDSPacketType.SQL_BATCH
+                packet.Data = sql.encode('utf-16-le')
+                await self.send_packet(packet)
+                while True:
+                    packettype, tokentype, token = await self.__result_queue.get()
+                    #print(f"packettype: {packettype}, tokentype: {tokentype.name}")
+                    if token is None:
+                        break
+                    
+                    yield packettype, tokentype, token
+                    
+                    if tokentype in [TDSTokenType.DONE, TDSTokenType.DONEINPROC, TDSTokenType.DONEPROC]:
+                        if token.is_final is True:
+                            break
+                    
         except Exception as e:
             traceback.print_exc()
-            print(e)
+
+    async def batch(self, sql:str):
+        result = QueryResult()
+        async for packettype, tokentype, token in self.batch_raw(sql):
+            if packettype == TDSPacketType.TABULAR_RESULT:
+                if tokentype == TDSTokenType.ERROR:
+                    result.add_error(token)
+                elif tokentype == TDSTokenType.ROW:
+                    result.add_row(token.values)
+                elif tokentype == TDSTokenType.COLMETADATA:
+                    result.add_colmetadata(token)
+                elif tokentype in [TDSTokenType.DONE, TDSTokenType.DONEINPROC, TDSTokenType.DONEPROC]:
+                    result.add_done(token)
+                elif tokentype == TDSTokenType.ORDER:
+                    result.add_order(token)
+                else:
+                    print(f"Unknown token type: {tokentype.name}")
+            else:
+                print(f"Unknown packet type: {packettype}")
+        return result
 
 if __name__ == "__main__":
     from asysocks.unicomm.common.target import UniTarget, UniProto
@@ -448,9 +504,12 @@ if __name__ == "__main__":
     async def main():
         connection = MSSQLConnection(target, credential)
         await connection.connect()
-        await connection.batch("use master")
+        result = await connection.batch("use master")
+        print(result)
+
         input('1')
-        await connection.batch("select @@version")
+        result = await connection.batch("select @@version")
+        print(result)
         input('2')
         query = """
 SELECT TOP 10 
@@ -462,7 +521,8 @@ SELECT TOP 10
     WHERE type NOT IN ('C', 'K')  -- Exclude certificates and keys
     ORDER BY create_date DESC;
         """
-        await connection.batch(query)
+        result = await connection.batch(query)
+        print(result)
         input('3')
         query = """
 WITH Numbers AS (
@@ -487,6 +547,7 @@ WHERE s1.type_desc NOT IN ('AGGREGATE_FUNCTION', 'DEFAULT_CONSTRAINT')
     AND s2.type_desc NOT IN ('AGGREGATE_FUNCTION', 'DEFAULT_CONSTRAINT')
 ORDER BY n.n, s1.name, s2.name;
         """
-        await connection.batch(query)
+        result = await connection.batch(query)
+        print(result)
         input('4')
     asyncio.run(main())

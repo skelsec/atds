@@ -1,14 +1,14 @@
 from dataclasses import dataclass
 from enum import IntFlag
 from typing import List, Optional
-from io import BytesIO
+import io
 from atds.tds.column import Column
 from atds.tds.types import SerializerFactory
 from atds.tds.tds_base import IS_TDS72_PLUS, TDS71, TDS74, _Results
 from atds.tds.collate import ucs2_codec, Collation
 from typing import Callable, Iterable, Any, Tuple
 from atds.tds.utils import BufferReader
-
+from atds.protocol.packets.tokenstream import TDSTokenStreamBase
 
 def tuple_row_strategy(
     column_names: Iterable[str]
@@ -60,59 +60,48 @@ class ColumnData:
     crypto_metadata: Optional[CryptoMetaData] = None
     column_name: str = ""
 
-class TDS_COLMETADATA:
-    TOKEN_TYPE = 0x81  # COLMETADATA_TOKEN
-
-    def __init__(self) -> None:
+class TDS_COLMETADATA(TDSTokenStreamBase):
+    def __init__(self, **kwargs) -> None:
+        super().__init__(0x81, **kwargs)
         self.count: int = 0
         self.columns: List[ColumnData] = []
         self.cek_table: List[bytes] = []  # Encryption keys table (TDS 7.4+)
-        self.length: int = 0
         self.row_strategy = None
+        self.column_names: List[str] = []
         self.info = None
 
-    @staticmethod
-    def from_bytes(data: bytes, tds_version: int = TDS71) -> 'TDS_COLMETADATA':
-        
-        if len(data) < 3:  # Minimum: token(1) + count(2)
-            raise ValueError("COLMETADATA data too short")
-
-        stream = BytesIO(data)
-        
+    def from_reader(self, reader: BufferReader) -> 'TDS_COLMETADATA':
         # Verify token type
-        token = stream.read(1)[0]
-        if token != TDS_COLMETADATA.TOKEN_TYPE:
-            raise ValueError(f"Invalid TOKEN_TYPE: expected 0x81, got {hex(token)}")
+        token = reader.get_byte()
+        if token != self.tokentype:
+            raise ValueError(f"Invalid TOKEN_TYPE: expected {self.tokentype}, got {hex(token)}")
 
-        packet = TDS_COLMETADATA()
-
-        # Parse column count (2 bytes)
-        packet.count = int.from_bytes(stream.read(2), byteorder='little')
+        self.count = int.from_bytes(reader.read(2), byteorder='little')
 
         # Check for NoMetaData case
-        if packet.count == 0xFFFF:
-            return packet
+        if self.count == 0xFFFF:
+            return self
 
         # Parse CEK table if encryption is enabled (TDS 7.4+)
-        if tds_version >= TDS74:
-            ek_count = int.from_bytes(stream.read(2), byteorder='little')
+        if self.tds_version >= TDS74:
+            ek_count = int.from_bytes(reader.read(2), byteorder='little')
             for _ in range(ek_count):
                 # Parse EK_INFO structure
-                ek_length = int.from_bytes(stream.read(2), byteorder='little')
-                packet.cek_table.append(stream.read(ek_length))
+                ek_length = int.from_bytes(reader.read(2), byteorder='little')
+                self.cek_table.append(reader.read(ek_length))
 
         info = _Results()
         columns = []
         header_tuple = []
         # Parse each column's metadata
-        r = BufferReader(stream)
-        for _ in range(packet.count):
+        
+        for _ in range(self.count):
             curcol = Column()
             columns.append(curcol)
             info.columns.append(curcol)
-            TDS_COLMETADATA.get_type_info(tds_version, curcol, r)
-            curcol.column_name = r.read_ucs2(r.get_byte())
-
+            TDS_COLMETADATA.get_type_info(self.tds_version, curcol, reader)
+            curcol.column_name = reader.read_ucs2(reader.get_byte())
+            self.column_names.append(curcol.column_name)
             precision = curcol.serializer.precision
             scale = curcol.serializer.scale
             size = curcol.serializer.size
@@ -129,14 +118,12 @@ class TDS_COLMETADATA:
             )
         
         info.description = tuple(header_tuple)
-        packet.columns = columns
-        packet.header_tuple = header_tuple
-        packet.length = stream.tell() - 3
-
+        self.columns = columns
+        self.header_tuple = header_tuple
         column_names = [col[0] for col in info.description]
-        packet.row_strategy = tuple_row_strategy(column_names)
-        packet.info = info
-        return packet
+        self.row_strategy = tuple_row_strategy(column_names)
+        self.info = info
+        return self
             
     def __str__(self):
         return f"TDS_COLMETADATA(count={self.count}, columns={self.columns})"
