@@ -226,7 +226,6 @@ class MSSQLConnection:
                 await self.network.close()
             if self.handle_incoming_task is not None:
                 self.handle_incoming_task.cancel()
-            self.__handle_incoming_packet_data.put_nowait(None)
         finally:
             self.connection_closed_event.set()
     
