@@ -31,10 +31,11 @@ def encryptPassword(password:str | bytes) -> bytes:
 
 
 class MSSQLConnection:
-    def __init__(self, target, credential, auth=None):
+    def __init__(self, target, credential, auth=None, smbcredential=None):
         self.target = target
         self.credential = credential
         self.auth = auth
+        self.smbcredential = smbcredential
         self.packetizer = TDSPacketizer()
         self._closed = False
         self.network = None
@@ -245,7 +246,7 @@ class MSSQLConnection:
                 client = UniClient(self.target, self.packetizer)
                 self.network = await asyncio.wait_for(client.connect(), timeout=self.target.timeout)
             else:
-                self.network = SMBPipeNetwork(self.target, self.credential)
+                self.network = SMBPipeNetwork(self.target, self.smbcredential if self.smbcredential is not None else self.credential)
                 _, err = await self.network.connect()
                 if err is not None:
                     raise err

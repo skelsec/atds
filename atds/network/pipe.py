@@ -1,5 +1,6 @@
 import copy
 import traceback
+import asyncio
 
 from atds.common.target import MSSQLTarget
 
@@ -18,6 +19,7 @@ class SMBPipeNetwork:
         self.pipe = None
         self.connection = None
         self.packetizer = Packetizer()
+        self.disconnect_event = asyncio.Event()
     
     def change_packetizer(self, packetizer):
         rem_data = self.packetizer.flush_buffer()
@@ -33,11 +35,12 @@ class SMBPipeNetwork:
         return await self.pipe.read(size)
     
     async def close(self):
+        self.disconnect_event.set()
         await self.pipe.close()
         await self.connection.disconnect()
 
     async def read_one(self):
-        while True:
+        while not self.disconnect_event.is_set():
             data, err = await self.pipe.read(1024)
             if err is not None:
                 raise err
@@ -49,7 +52,7 @@ class SMBPipeNetwork:
     
     async def read(self):
         try:
-            while True:
+            while not self.disconnect_event.is_set():
                 data, err = await self.pipe.read(1024)
                 if err is not None:
                     raise err
@@ -65,17 +68,20 @@ class SMBPipeNetwork:
 
     async def connect(self):
         try:
-            if self.credential.protocol == asyauthProtocol.KERBEROS:
-                kerberostarget = self.target.get_kerberos_target()
-                gssapi = SPNEGOCredential([self.credential]).build_context(target=kerberostarget)
-            elif self.credential.protocol == asyauthProtocol.NTLM:
-                gssapi = SPNEGOCredential([self.credential]).build_context()
+            if not isinstance(self.credential, UniCredential):
+                gssapi = copy.deepcopy(self.credential)
             else:
-                # straight up password with no indication of what protocol is used
-                # let's do ntlm that is more likely
-                smbntlmcred = copy.deepcopy(self.credential)
-                smbntlmcred.protocol = asyauthProtocol.NTLM
-                gssapi = SPNEGOCredential([smbntlmcred]).build_context()
+                if self.credential.protocol == asyauthProtocol.KERBEROS:
+                    kerberostarget = self.target.get_kerberos_target()
+                    gssapi = SPNEGOCredential([self.credential]).build_context(target=kerberostarget)
+                elif self.credential.protocol == asyauthProtocol.NTLM:
+                    gssapi = SPNEGOCredential([self.credential]).build_context()
+                else:
+                    # straight up password with no indication of what protocol is used
+                    # let's do ntlm that is more likely
+                    smbntlmcred = copy.deepcopy(self.credential)
+                    smbntlmcred.protocol = asyauthProtocol.NTLM
+                    gssapi = SPNEGOCredential([smbntlmcred]).build_context()
                 
             smbtarget = self.target.get_smb_target()
             self.connection = SMBConnection(gssapi, smbtarget)

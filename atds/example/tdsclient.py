@@ -508,7 +508,12 @@ AND pe.permission_name = 'IMPERSONATE';
             return self.__handle_error(e)
 
 async def amain(args):
-    factory = MSSQLConnectionFactory.from_url(args.url)
+    if args.smburl is not None:
+        from aiosmb.commons.connection.factory import SMBConnectionFactory
+        smb_factory = SMBConnectionFactory.from_url(args.smburl)
+    else:
+        smb_factory = None
+    factory = MSSQLConnectionFactory.from_url(args.url, smbcredential = smb_factory.get_credential() if smb_factory is not None else None)
     console = MSSQLConsole(factory)
     
     if len(args.commands) == 0:
@@ -533,10 +538,11 @@ def main():
     import argparse
     import platform
 
-    parser = argparse.ArgumentParser(description='MS LDAP library')
+    parser = argparse.ArgumentParser(description='MS SQL TDS client')
     parser.add_argument('-v', '--verbose', action='count', default=0, help='Verbosity, can be stacked')
     parser.add_argument('-n', '--no-interactive', action='store_true')
     parser.add_argument('url', help='Connection string in URL format.')
+    parser.add_argument('--smburl', help='SMB connection string in URL format. If not provided, will use the same credential for both SMB and MSSQL over pipe connections.')
     parser.add_argument('commands', nargs='*', help="Takes a series of commands which will be executed until error encountered. If the command is 'i' is encountered during execution it drops back to interactive shell.")
 
     args = parser.parse_args()
